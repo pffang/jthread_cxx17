@@ -2,6 +2,12 @@
 #ifndef JTHREAD_CXX17_H_
 #    define JTHREAD_CXX17_H_
 
+// 定义宏开关：1 使用自旋锁，0 使用互斥锁
+// 自旋锁适合低竞争场景，互斥锁适合高竞争或节能需求
+#    ifndef JTHREAD_USE_SPINLOCK
+#        define JTHREAD_USE_SPINLOCK 0
+#    endif
+
 #    include <atomic>
 #    include <chrono>
 #    include <condition_variable>
@@ -51,23 +57,26 @@ private:
     friend class stop_source;
     template <typename _Callback> friend class stop_callback;
 
-#    ifndef __cpp_lib_semaphore
     struct binary_semaphore {
-        explicit binary_semaphore(int __d) : _M_counter(__d > 0) {}
+        explicit binary_semaphore(int __d) : _M_available(__d > 0) {}
 
-        void release() { _M_counter.fetch_add(1, std::memory_order_release); }
-
-        void acquire() {
-            int __old = 1;
-            while (!_M_counter.compare_exchange_weak(__old, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
-                __old = 1;
-                std::this_thread::yield();
-            }
+        void release() {
+            std::unique_lock<std::mutex> lock(_M_mutex);
+            _M_available = true;
+            _M_cv.notify_one();
         }
 
-        std::atomic<int> _M_counter;
+        void acquire() {
+            std::unique_lock<std::mutex> lock(_M_mutex);
+            _M_cv.wait(lock, [this]() { return _M_available; });
+            _M_available = false;
+        }
+
+    private:
+        std::mutex              _M_mutex;
+        std::condition_variable _M_cv;
+        bool                    _M_available;
     };
-#    endif
 
     struct _Stop_cb {
         using __cb_type = void(_Stop_cb *) noexcept;
@@ -86,39 +95,75 @@ private:
         using value_type = uint32_t;
 
         static constexpr value_type _S_stop_requested_bit = 1;
-        static constexpr value_type _S_locked_bit         = 2;
-        static constexpr value_type _S_ssrc_counter_inc   = 4;
+#    if JTHREAD_USE_SPINLOCK
+        static constexpr value_type _S_locked_bit = 2;
+#    endif
+        static constexpr value_type _S_ssrc_counter_inc = 4;
 
-        std::atomic<value_type> _M_owners{1};
         std::atomic<value_type> _M_value{_S_ssrc_counter_inc};
         _Stop_cb               *_M_head = nullptr;
         std::thread::id         _M_requester;
+        std::mutex              _M_mutex; // 互斥锁版本
+#    if JTHREAD_USE_SPINLOCK
+        bool _M_try_lock(value_type &__curval, std::memory_order __failure = std::memory_order_acquire) noexcept {
+            return _M_do_try_lock(__curval, 0, std::memory_order_acquire, __failure);
+        }
+        bool _M_try_lock_and_stop(value_type &__curval) noexcept {
+            return _M_do_try_lock(__curval, _S_stop_requested_bit, std::memory_order_acq_rel,
+                                  std::memory_order_acquire);
+        }
+        bool _M_do_try_lock(value_type &__curval, value_type __newbits, std::memory_order __success,
+                            std::memory_order __failure) noexcept {
+            if (__curval & _S_locked_bit) {
+                std::this_thread::yield();
+                __curval = _M_value.load(__failure);
+                return false;
+            }
+            __newbits |= _S_locked_bit;
+            return _M_value.compare_exchange_weak(__curval, __curval | __newbits, __success, __failure);
+        }
+#    endif
 
-        _Stop_state_t() = default;
-
-        bool _M_stop_possible() noexcept { return _M_value.load(std::memory_order_acquire) & ~_S_locked_bit; }
+        bool _M_stop_possible() noexcept {
+#    if JTHREAD_USE_SPINLOCK
+            return _M_value.load(std::memory_order_acquire) & ~_S_locked_bit;
+#    else
+            return _M_value.load(std::memory_order_acquire) >= _S_ssrc_counter_inc;
+#    endif
+        }
 
         bool _M_stop_requested() noexcept { return _M_value.load(std::memory_order_acquire) & _S_stop_requested_bit; }
-
-        void _M_add_owner() noexcept { _M_owners.fetch_add(1, std::memory_order_relaxed); }
-
-        void _M_release_ownership() noexcept {
-            if (_M_owners.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                delete this;
-        }
 
         void _M_add_ssrc() noexcept { _M_value.fetch_add(_S_ssrc_counter_inc, std::memory_order_relaxed); }
 
         void _M_sub_ssrc() noexcept { _M_value.fetch_sub(_S_ssrc_counter_inc, std::memory_order_release); }
+
+#    if JTHREAD_USE_SPINLOCK
         void _M_lock() noexcept {
-            auto __old = _M_value.load(std::memory_order_relaxed);
+            auto         __old   = _M_value.load(std::memory_order_relaxed);
+            unsigned int __spins = 0;
             while (!_M_try_lock(__old, std::memory_order_relaxed)) {
+                if (++__spins > 100) { // 避免过度自旋，转为 yield
+                    std::this_thread::yield();
+                    __spins = 0;
+                }
             }
         }
 
         void _M_unlock() noexcept { _M_value.fetch_sub(_S_locked_bit, std::memory_order_release); }
+#    else
+        void _M_lock() { _M_mutex.lock(); }
+
+        void _M_unlock() { _M_mutex.unlock(); }
+#    endif
 
         bool _M_request_stop() noexcept {
+#    if JTHREAD_USE_SPINLOCK
+            // 快速路径：用 relaxed 检查是否已停止，避免不必要的锁竞争
+            if (_M_value.load(std::memory_order_relaxed) & _S_stop_requested_bit) {
+                return false;
+            }
+
             auto __old = _M_value.load(std::memory_order_acquire);
             do {
                 if (__old & _S_stop_requested_bit) // stop request already made
@@ -159,9 +204,50 @@ private:
 
             _M_unlock();
             return true;
+#    else
+            std::unique_lock<std::mutex> lock(_M_mutex);
+            if (_M_value.load(std::memory_order_acquire) & _S_stop_requested_bit) {
+                return false;
+            }
+            _M_value.fetch_or(_S_stop_requested_bit, std::memory_order_acq_rel);
+            _M_requester = std::this_thread::get_id();
+
+            while (_M_head) {
+                bool      __last_cb;
+                _Stop_cb *__cb = _M_head;
+                _M_head        = _M_head->_M_next;
+                if (_M_head) {
+                    _M_head->_M_prev = nullptr;
+                    __last_cb        = false;
+                } else
+                    __last_cb = true;
+
+                // Allow other callbacks to be unregistered while __cb runs.
+                lock.unlock();
+
+                bool __destroyed   = false;
+                __cb->_M_destroyed = &__destroyed;
+
+                // run callback
+                __cb->_M_run();
+
+                if (!__destroyed) {
+                    __cb->_M_destroyed = nullptr;
+                    __cb->_M_done.release();
+                }
+
+                if (__last_cb)
+                    return true;
+
+                lock.lock();
+            }
+
+            return true;
+#    endif
         }
 
         bool _M_register_callback(_Stop_cb *__cb) noexcept {
+#    if JTHREAD_USE_SPINLOCK
             auto __old = _M_value.load(std::memory_order_acquire);
             do {
                 if (__old & _S_stop_requested_bit) {
@@ -180,9 +266,28 @@ private:
             _M_head = __cb;
             _M_unlock();
             return true;
+#    else
+            std::unique_lock<std::mutex> lock(_M_mutex);
+            auto                         __val = _M_value.load(std::memory_order_acquire);
+            if (__val & _S_stop_requested_bit) {
+                __cb->_M_run();
+                return false;
+            }
+
+            if (__val < _S_ssrc_counter_inc)
+                return false;
+
+            __cb->_M_next = _M_head;
+            if (_M_head) {
+                _M_head->_M_prev = __cb;
+            }
+            _M_head = __cb;
+            return true;
+#    endif
         }
 
         void _M_remove_callback(_Stop_cb *__cb) {
+#    if JTHREAD_USE_SPINLOCK
             _M_lock();
 
             if (__cb == _M_head) {
@@ -208,65 +313,60 @@ private:
 
             if (__cb->_M_destroyed)
                 *__cb->_M_destroyed = true;
-        };
+#    else
+            std::unique_lock<std::mutex> lock(_M_mutex);
 
-        bool _M_try_lock(value_type &__curval, std::memory_order __failure = std::memory_order_acquire) noexcept {
-            return _M_do_try_lock(__curval, 0, std::memory_order_acquire, __failure);
-        }
-        bool _M_try_lock_and_stop(value_type &__curval) noexcept {
-            return _M_do_try_lock(__curval, _S_stop_requested_bit, std::memory_order_acq_rel,
-                                  std::memory_order_acquire);
-        }
-        bool _M_do_try_lock(value_type &__curval, value_type __newbits, std::memory_order __success,
-                            std::memory_order __failure) noexcept {
-            if (__curval & _S_locked_bit) {
-                std::this_thread::yield();
-                __curval = _M_value.load(__failure);
-                return false;
+            if (__cb == _M_head) {
+                _M_head = _M_head->_M_next;
+                if (_M_head)
+                    _M_head->_M_prev = nullptr;
+                return;
+            } else if (__cb->_M_prev) {
+                __cb->_M_prev->_M_next = __cb->_M_next;
+                if (__cb->_M_next)
+                    __cb->_M_next->_M_prev = __cb->_M_prev;
+                return;
             }
-            __newbits |= _S_locked_bit;
-            return _M_value.compare_exchange_weak(__curval, __curval | __newbits, __success, __failure);
-        }
+
+            lock.unlock();
+
+            if (!(_M_requester == std::this_thread::get_id())) {
+                __cb->_M_done.acquire();
+                return;
+            }
+
+            if (__cb->_M_destroyed)
+                *__cb->_M_destroyed = true;
+#    endif
+        };
     };
 
     struct _Stop_state_ref {
         _Stop_state_ref() = default;
 
-        explicit _Stop_state_ref(const stop_source &) : _M_ptr(new _Stop_state_t()) {}
+        explicit _Stop_state_ref(const stop_source &) : _M_ptr(std::make_shared<_Stop_state_t>()) {}
 
-        _Stop_state_ref(const _Stop_state_ref &__other) noexcept : _M_ptr(__other._M_ptr) {
-            if (_M_ptr)
-                _M_ptr->_M_add_owner();
-        }
+        _Stop_state_ref(const _Stop_state_ref &__other) noexcept : _M_ptr(__other._M_ptr) {}
 
-        _Stop_state_ref(_Stop_state_ref &&__other) noexcept : _M_ptr(__other._M_ptr) { __other._M_ptr = nullptr; }
+        _Stop_state_ref(_Stop_state_ref &&__other) noexcept : _M_ptr(std::move(__other._M_ptr)) {}
 
         _Stop_state_ref &operator=(const _Stop_state_ref &__other) noexcept {
-            if (auto __ptr = __other._M_ptr; __ptr != _M_ptr) {
-                if (__ptr)
-                    __ptr->_M_add_owner();
-                if (_M_ptr)
-                    _M_ptr->_M_release_ownership();
-                _M_ptr = __ptr;
-            }
+            _M_ptr = __other._M_ptr;
             return *this;
         }
 
         _Stop_state_ref &operator=(_Stop_state_ref &&__other) noexcept {
-            _Stop_state_ref(std::move(__other)).swap(*this);
+            _M_ptr = std::move(__other._M_ptr);
             return *this;
         }
 
-        ~_Stop_state_ref() {
-            if (_M_ptr)
-                _M_ptr->_M_release_ownership();
-        }
+        ~_Stop_state_ref() = default;
 
         void swap(_Stop_state_ref &__other) noexcept { std::swap(_M_ptr, __other._M_ptr); }
 
         explicit operator bool() const noexcept { return _M_ptr != nullptr; }
 
-        _Stop_state_t *operator->() const noexcept { return _M_ptr; }
+        _Stop_state_t *operator->() const noexcept { return _M_ptr.get(); }
 
 #    if __cpp_impl_three_way_comparison >= 201907L
         friend bool operator==(const _Stop_state_ref &, const _Stop_state_ref &) = default;
@@ -281,7 +381,7 @@ private:
 #    endif
 
     private:
-        _Stop_state_t *_M_ptr = nullptr;
+        std::shared_ptr<_Stop_state_t> _M_ptr;
     };
 
     _Stop_state_ref _M_state;
@@ -295,29 +395,18 @@ public:
 
     explicit stop_source(nostopstate_t) noexcept {}
 
-    stop_source(const stop_source &__other) noexcept : _M_state(__other._M_state) {
-        if (_M_state)
-            _M_state->_M_add_ssrc();
-    }
+    stop_source(const stop_source &__other) noexcept : _M_state(__other._M_state) {}
 
     stop_source(stop_source &&) noexcept = default;
 
     stop_source &operator=(const stop_source &__other) noexcept {
-        if (_M_state != __other._M_state) {
-            stop_source __sink(std::move(*this));
-            _M_state = __other._M_state;
-            if (_M_state)
-                _M_state->_M_add_ssrc();
-        }
+        _M_state = __other._M_state;
         return *this;
     }
 
     stop_source &operator=(stop_source &&) noexcept = default;
 
-    ~stop_source() {
-        if (_M_state)
-            _M_state->_M_sub_ssrc();
-    }
+    ~stop_source() {}
 
     [[nodiscard]]
     bool stop_possible() const noexcept {
@@ -373,10 +462,9 @@ public:
     template <typename _Cb, std::enable_if_t<std::is_constructible_v<_Callback, _Cb>, int> = 0>
     explicit stop_callback(stop_token &&__token, _Cb &&__cb) noexcept(std::is_nothrow_constructible_v<_Callback, _Cb>)
         : _M_cb(std::forward<_Cb>(__cb)) {
-        if (auto &__state = __token._M_state) {
-            if (__state->_M_register_callback(&_M_cb))
-                _M_state.swap(__state);
-        }
+        auto __state = std::move(__token._M_state);
+        if (__state && __state->_M_register_callback(&_M_cb))
+            _M_state.swap(__state);
     }
 
     ~stop_callback() {
@@ -408,14 +496,12 @@ private:
 
 template <typename _Callback> stop_callback(stop_token, _Callback) -> stop_callback<_Callback>;
 
-#    ifndef __STRICT_ANSI__
 template <typename _Callable, typename... _Args> constexpr bool __pmf_expects_stop_token = false;
 
 template <typename _Callable, typename _Obj, typename... _Args>
 constexpr bool __pmf_expects_stop_token<_Callable, _Obj, _Args...> =
     std::conjunction<std::is_member_function_pointer<std::remove_reference_t<_Callable>>,
                      std::is_invocable<_Callable, _Obj, stop_token, _Args...>>::value;
-#    endif
 
 template <typename T> struct remove_cvref : std::remove_cv<std::remove_reference_t<T>> {};
 template <typename T> using remove_cvref_t = typename remove_cvref<T>::type;
@@ -426,27 +512,24 @@ class jthread {
 
     template <typename _Callable, typename... _Args>
     static std::thread _S_create(stop_source &__ssrc, _Callable &&__f, _Args &&...__args) {
-#    ifndef __STRICT_ANSI__
         if constexpr (__pmf_expects_stop_token<_Callable, _Args...>)
             return _S_create_pmf(__ssrc, __f, std::forward<_Args>(__args)...);
         else
-#    endif
+
             if constexpr (std::is_invocable_v<std::decay_t<_Callable>, stop_token, std::decay_t<_Args>...>)
             return std::thread{std::forward<_Callable>(__f), __ssrc.get_token(), std::forward<_Args>(__args)...};
         else {
             static_assert(std::is_invocable_v<std::decay_t<_Callable>, std::decay_t<_Args>...>,
-                          "std::jthread arguments must be invocable after"
+                          "jthread_cxx17::jthread arguments must be invocable after"
                           " conversion to rvalues");
             return std::thread{std::forward<_Callable>(__f), std::forward<_Args>(__args)...};
         }
     }
 
-#    ifndef __STRICT_ANSI__
     template <typename _Callable, typename _Obj, typename... _Args>
     static std::thread _S_create_pmf(stop_source &__ssrc, _Callable __f, _Obj &&__obj, _Args &&...__args) {
         return std::thread{__f, std::forward<_Obj>(__obj), __ssrc.get_token(), std::forward<_Args>(__args)...};
     }
-#    endif
 
 public:
     using id                 = std::thread::id;
@@ -494,8 +577,8 @@ public:
 
 class condition_variable_any {
     using __clock_t = std::chrono::steady_clock;
-    std::condition_variable     _M_cond;
-    std::shared_ptr<std::mutex> _M_mutex;
+    std::condition_variable _M_cond;
+    std::mutex              _M_mutex; // 直接使用成员变量
 
     template <typename _Lock> struct _Unlock {
         explicit _Unlock(_Lock &__lk) : _M_lock(__lk) { __lk.unlock(); }
@@ -516,25 +599,25 @@ class condition_variable_any {
     };
 
 public:
-    condition_variable_any() : _M_mutex(std::make_shared<std::mutex>()) {}
+    condition_variable_any() : _M_mutex() {}
     ~condition_variable_any() = default;
 
     condition_variable_any(const condition_variable_any &)            = delete;
     condition_variable_any &operator=(const condition_variable_any &) = delete;
 
     void notify_one() noexcept {
-        std::lock_guard<std::mutex> __lock(*_M_mutex);
+        std::lock_guard<std::mutex> __lock(_M_mutex);
         _M_cond.notify_one();
     }
 
     void notify_all() noexcept {
-        std::lock_guard<std::mutex> __lock(*_M_mutex);
+        std::lock_guard<std::mutex> __lock(_M_mutex);
         _M_cond.notify_all();
     }
 
     template <typename _Lock> void wait(_Lock &__lock) {
-        std::shared_ptr<std::mutex>  __mutex = _M_mutex;
-        std::unique_lock<std::mutex> __my_lock(*__mutex);
+        std::mutex                  &__mutex = _M_mutex;
+        std::unique_lock<std::mutex> __my_lock(__mutex);
         _Unlock<_Lock>               __unlock(__lock);
         // *__mutex must be unlocked before re-locking __lock so move
         // ownership of *__mutex lock to an object with shorter lifetime.
@@ -549,8 +632,8 @@ public:
 
     template <typename _Lock, typename _Clock, typename _Duration>
     std::cv_status wait_until(_Lock &__lock, const std::chrono::time_point<_Clock, _Duration> &__atime) {
-        std::shared_ptr<std::mutex>  __mutex = _M_mutex;
-        std::unique_lock<std::mutex> __my_lock(*__mutex);
+        std::mutex                  &__mutex = _M_mutex;
+        std::unique_lock<std::mutex> __my_lock(__mutex);
         _Unlock<_Lock>               __unlock(__lock);
         // *__mutex must be unlocked before re-locking __lock so move
         // ownership of *__mutex lock to an object with shorter lifetime.
@@ -581,10 +664,10 @@ public:
             return __p();
         }
 
-        stop_callback               __cb(__stoken, [this] { notify_all(); });
-        std::shared_ptr<std::mutex> __mutex = _M_mutex;
+        stop_callback __cb(__stoken, [this] { notify_all(); });
+        std::mutex   &__mutex = _M_mutex;
         while (!__p()) {
-            std::unique_lock<std::mutex> __my_lock(*__mutex);
+            std::unique_lock<std::mutex> __my_lock(__mutex);
             if (__stoken.stop_requested()) {
                 return false;
             }
@@ -604,12 +687,12 @@ public:
             return __p();
         }
 
-        stop_callback               __cb(__stoken, [this] { notify_all(); });
-        std::shared_ptr<std::mutex> __mutex = _M_mutex;
+        stop_callback __cb(__stoken, [this] { notify_all(); });
+        std::mutex   &__mutex = _M_mutex;
         while (!__p()) {
             bool __stop;
             {
-                std::unique_lock<std::mutex> __my_lock(*__mutex);
+                std::unique_lock<std::mutex> __my_lock(__mutex);
                 if (__stoken.stop_requested()) {
                     return false;
                 }
