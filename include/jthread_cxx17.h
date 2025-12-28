@@ -17,6 +17,15 @@
 
 namespace jthread_cxx17 {
 
+#    if __cplusplus >= 202002L
+#        include <stop_token>
+using nostopstate_t                               = std::nostopstate_t;
+using stop_token                                  = std::stop_token;
+using stop_source                                 = std::stop_source;
+template <typename _Callback> using stop_callback = std::stop_callback<_Callback>;
+using jthread                                     = std::jthread;
+using condition_variable_any                      = std::condition_variable_any;
+#    else
 struct nostopstate_t {
     explicit nostopstate_t() = default;
 };
@@ -95,16 +104,16 @@ private:
         using value_type = uint32_t;
 
         static constexpr value_type _S_stop_requested_bit = 1;
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
         static constexpr value_type _S_locked_bit = 2;
-#    endif
+#        endif
         static constexpr value_type _S_ssrc_counter_inc = 4;
 
         std::atomic<value_type> _M_value{_S_ssrc_counter_inc};
         _Stop_cb               *_M_head = nullptr;
         std::thread::id         _M_requester;
         std::mutex              _M_mutex; // 互斥锁版本
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
         bool _M_try_lock(value_type &__curval, std::memory_order __failure = std::memory_order_acquire) noexcept {
             return _M_do_try_lock(__curval, 0, std::memory_order_acquire, __failure);
         }
@@ -122,14 +131,14 @@ private:
             __newbits |= _S_locked_bit;
             return _M_value.compare_exchange_weak(__curval, __curval | __newbits, __success, __failure);
         }
-#    endif
+#        endif
 
         bool _M_stop_possible() noexcept {
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
             return _M_value.load(std::memory_order_acquire) & ~_S_locked_bit;
-#    else
+#        else
             return _M_value.load(std::memory_order_acquire) >= _S_ssrc_counter_inc;
-#    endif
+#        endif
         }
 
         bool _M_stop_requested() noexcept { return _M_value.load(std::memory_order_acquire) & _S_stop_requested_bit; }
@@ -138,7 +147,7 @@ private:
 
         void _M_sub_ssrc() noexcept { _M_value.fetch_sub(_S_ssrc_counter_inc, std::memory_order_release); }
 
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
         void _M_lock() noexcept {
             auto         __old   = _M_value.load(std::memory_order_relaxed);
             unsigned int __spins = 0;
@@ -151,14 +160,14 @@ private:
         }
 
         void _M_unlock() noexcept { _M_value.fetch_sub(_S_locked_bit, std::memory_order_release); }
-#    else
+#        else
         void _M_lock() { _M_mutex.lock(); }
 
         void _M_unlock() { _M_mutex.unlock(); }
-#    endif
+#        endif
 
         bool _M_request_stop() noexcept {
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
             // 快速路径：用 relaxed 检查是否已停止，避免不必要的锁竞争
             if (_M_value.load(std::memory_order_relaxed) & _S_stop_requested_bit) {
                 return false;
@@ -204,7 +213,7 @@ private:
 
             _M_unlock();
             return true;
-#    else
+#        else
             std::unique_lock<std::mutex> lock(_M_mutex);
             if (_M_value.load(std::memory_order_acquire) & _S_stop_requested_bit) {
                 return false;
@@ -243,11 +252,11 @@ private:
             }
 
             return true;
-#    endif
+#        endif
         }
 
         bool _M_register_callback(_Stop_cb *__cb) noexcept {
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
             auto __old = _M_value.load(std::memory_order_acquire);
             do {
                 if (__old & _S_stop_requested_bit) {
@@ -266,7 +275,7 @@ private:
             _M_head = __cb;
             _M_unlock();
             return true;
-#    else
+#        else
             std::unique_lock<std::mutex> lock(_M_mutex);
             auto                         __val = _M_value.load(std::memory_order_acquire);
             if (__val & _S_stop_requested_bit) {
@@ -283,11 +292,11 @@ private:
             }
             _M_head = __cb;
             return true;
-#    endif
+#        endif
         }
 
         void _M_remove_callback(_Stop_cb *__cb) {
-#    if JTHREAD_USE_SPINLOCK
+#        if JTHREAD_USE_SPINLOCK
             _M_lock();
 
             if (__cb == _M_head) {
@@ -313,7 +322,7 @@ private:
 
             if (__cb->_M_destroyed)
                 *__cb->_M_destroyed = true;
-#    else
+#        else
             std::unique_lock<std::mutex> lock(_M_mutex);
 
             if (__cb == _M_head) {
@@ -337,7 +346,7 @@ private:
 
             if (__cb->_M_destroyed)
                 *__cb->_M_destroyed = true;
-#    endif
+#        endif
         };
     };
 
@@ -368,9 +377,9 @@ private:
 
         _Stop_state_t *operator->() const noexcept { return _M_ptr.get(); }
 
-#    if __cpp_impl_three_way_comparison >= 201907L
+#        if __cpp_impl_three_way_comparison >= 201907L
         friend bool operator==(const _Stop_state_ref &, const _Stop_state_ref &) = default;
-#    else
+#        else
         friend bool operator==(const _Stop_state_ref &__lhs, const _Stop_state_ref &__rhs) noexcept {
             return __lhs._M_ptr == __rhs._M_ptr;
         }
@@ -378,7 +387,7 @@ private:
         friend bool operator!=(const _Stop_state_ref &__lhs, const _Stop_state_ref &__rhs) noexcept {
             return __lhs._M_ptr != __rhs._M_ptr;
         }
-#    endif
+#        endif
 
     private:
         std::shared_ptr<_Stop_state_t> _M_ptr;
@@ -715,6 +724,8 @@ public:
         return wait_until(__lock, std::move(__stoken), __abst, std::move(__p));
     }
 };
+
+#    endif
 
 } // namespace jthread_cxx17
 #endif // JTHREAD_CXX17_H_
